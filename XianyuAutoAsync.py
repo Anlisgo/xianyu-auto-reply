@@ -3089,7 +3089,9 @@ class XianyuLive:
             logger.error(f"调试消息结构时发生错误: {self._safe_str(e)}")
 
     async def get_default_reply(self, send_user_name: str, send_user_id: str, send_message: str, chat_id: str, item_id: str = None) -> dict:
-        """获取默认回复内容，支持指定商品回复、变量替换、只回复一次功能和图片发送
+        """获取默认回复内容，支持商品级别默认回复、变量替换、只回复一次功能和图片发送
+        
+        优先级：商品默认回复 > 账号默认回复
         
         Returns:
             dict: 包含 'text' (文字回复) 和 'image_url' (图片URL，可选) 的字典
@@ -3099,42 +3101,59 @@ class XianyuLive:
         try:
             from db_manager import db_manager
 
-            # 1. 优先检查指定商品回复
+            # 1. 优先检查商品级别默认回复
             if item_id:
-                item_reply = db_manager.get_item_reply(self.cookie_id, item_id)
-                if item_reply and item_reply.get('reply_content'):
-                    reply_content = item_reply['reply_content']
-                    logger.info(f"【{self.cookie_id}】使用指定商品回复: 商品ID={item_id}")
-
+                logger.info(f"【{self.cookie_id}】检查商品默认回复: item_id={item_id}")
+                item_default_reply = db_manager.get_item_default_reply(self.cookie_id, item_id)
+                logger.info(f"【{self.cookie_id}】商品默认回复查询结果: {item_default_reply}")
+                if item_default_reply and item_default_reply.get('enabled', False):
+                    reply_content = item_default_reply.get('reply_content', '')
+                    reply_image_url = item_default_reply.get('reply_image_url', '')
+                    
+                    # 如果文字和图片都为空，返回空回复标记
+                    if (not reply_content or reply_content.strip() == '') and (not reply_image_url or reply_image_url.strip() == ''):
+                        logger.info(f"【{self.cookie_id}】商品 {item_id} 默认回复内容和图片都为空，不进行回复")
+                        return "EMPTY_REPLY"
+                    
+                    # 检查"只回复一次"功能（商品级别）
+                    if item_default_reply.get('reply_once', False) and chat_id:
+                        if db_manager.has_default_reply_record(self.cookie_id, chat_id, item_id):
+                            logger.info(f"【{self.cookie_id}】商品 {item_id} 已对用户 {chat_id} 回复过，跳过（只回复一次）")
+                            return "ALREADY_REPLIED"
+                    
                     # 进行变量替换
-                    try:
-                        formatted_reply = reply_content.format(
-                            send_user_name=send_user_name,
-                            send_user_id=send_user_id,
-                            send_message=send_message,
-                            item_id=item_id
-                        )
-                        logger.info(f"【{self.cookie_id}】指定商品回复内容: {formatted_reply}")
-                        return {'text': formatted_reply, 'image_url': None}
-                    except Exception as format_error:
-                        logger.error(f"指定商品回复变量替换失败: {self._safe_str(format_error)}")
-                        # 如果变量替换失败，返回原始内容
-                        return {'text': reply_content, 'image_url': None}
-                else:
-                    logger.warning(f"【{self.cookie_id}】商品ID {item_id} 没有配置指定回复，使用默认回复")
+                    formatted_reply = ''
+                    if reply_content and reply_content.strip():
+                        try:
+                            formatted_reply = reply_content.format(
+                                send_user_name=send_user_name,
+                                send_user_id=send_user_id,
+                                send_message=send_message,
+                                item_id=item_id
+                            )
+                        except Exception as format_error:
+                            logger.error(f"商品默认回复变量替换失败: {self._safe_str(format_error)}")
+                            formatted_reply = reply_content
+                    
+                    # 如果开启了"只回复一次"功能，记录这次回复（商品级别）
+                    if item_default_reply.get('reply_once', False) and chat_id:
+                        db_manager.add_default_reply_record(self.cookie_id, chat_id, item_id)
+                        logger.info(f"【{self.cookie_id}】记录商品默认回复: item_id={item_id}, chat_id={chat_id}")
+                    
+                    logger.info(f"【{self.cookie_id}】使用商品默认回复: 商品ID={item_id}, 文字={formatted_reply}, 图片={reply_image_url}")
+                    return {'text': formatted_reply, 'image_url': reply_image_url if reply_image_url and reply_image_url.strip() else None}
 
-            # 2. 获取当前账号的默认回复设置
+            # 2. 获取账号级别的默认回复设置
             default_reply_settings = db_manager.get_default_reply(self.cookie_id)
 
             if not default_reply_settings or not default_reply_settings.get('enabled', False):
                 logger.warning(f"账号 {self.cookie_id} 未启用默认回复")
                 return None
 
-            # 检查"只回复一次"功能
+            # 检查"只回复一次"功能（账号级别）
             if default_reply_settings.get('reply_once', False) and chat_id:
-                # 检查是否已经回复过这个chat_id
-                if db_manager.has_default_reply_record(self.cookie_id, chat_id):
-                    logger.info(f"【{self.cookie_id}】chat_id {chat_id} 已使用过默认回复，跳过（只回复一次）")
+                if db_manager.has_default_reply_record(self.cookie_id, chat_id, None):
+                    logger.info(f"【{self.cookie_id}】chat_id {chat_id} 已使用过账号默认回复，跳过（只回复一次）")
                     return None
 
             reply_content = default_reply_settings.get('reply_content', '')
@@ -3143,33 +3162,29 @@ class XianyuLive:
             # 如果文字和图片都为空，返回空回复标记
             if (not reply_content or reply_content.strip() == '') and (not reply_image_url or reply_image_url.strip() == ''):
                 logger.info(f"账号 {self.cookie_id} 默认回复内容和图片都为空，不进行回复")
-                return "EMPTY_REPLY"  # 返回特殊标记表示不回复
+                return "EMPTY_REPLY"
 
             # 进行变量替换
-            try:
-                # 获取当前商品是否有设置自动回复
-                item_replay = db_manager.get_item_replay(item_id)
+            formatted_reply = ''
+            if reply_content and reply_content.strip():
+                try:
+                    formatted_reply = reply_content.format(
+                        send_user_name=send_user_name,
+                        send_user_id=send_user_id,
+                        send_message=send_message,
+                        item_id=item_id or ''
+                    )
+                except Exception as format_error:
+                    logger.error(f"账号默认回复变量替换失败: {self._safe_str(format_error)}")
+                    formatted_reply = reply_content
 
-                formatted_reply = reply_content.format(
-                    send_user_name=send_user_name,
-                    send_user_id=send_user_id,
-                    send_message=send_message
-                ) if reply_content else ''
+            # 如果开启了"只回复一次"功能，记录这次回复（账号级别）
+            if default_reply_settings.get('reply_once', False) and chat_id:
+                db_manager.add_default_reply_record(self.cookie_id, chat_id, None)
+                logger.info(f"【{self.cookie_id}】记录账号默认回复: chat_id={chat_id}")
 
-                if item_replay:
-                    formatted_reply = item_replay.get('reply_content', '')
-
-                # 如果开启了"只回复一次"功能，记录这次回复
-                if default_reply_settings.get('reply_once', False) and chat_id:
-                    db_manager.add_default_reply_record(self.cookie_id, chat_id)
-                    logger.info(f"【{self.cookie_id}】记录默认回复: chat_id={chat_id}")
-
-                logger.info(f"【{self.cookie_id}】使用默认回复: 文字={formatted_reply}, 图片={reply_image_url}")
-                return {'text': formatted_reply, 'image_url': reply_image_url if reply_image_url and reply_image_url.strip() else None}
-            except Exception as format_error:
-                logger.error(f"默认回复变量替换失败: {self._safe_str(format_error)}")
-                # 如果变量替换失败，返回原始内容
-                return {'text': reply_content, 'image_url': reply_image_url if reply_image_url and reply_image_url.strip() else None}
+            logger.info(f"【{self.cookie_id}】使用账号默认回复: 文字={formatted_reply}, 图片={reply_image_url}")
+            return {'text': formatted_reply, 'image_url': reply_image_url if reply_image_url and reply_image_url.strip() else None}
 
         except Exception as e:
             logger.error(f"获取默认回复失败: {self._safe_str(e)}")
@@ -7392,7 +7407,13 @@ class XianyuLive:
                         # 提取用户ID
                         try:
                             message_1 = message.get("1")
-                            if isinstance(message_1, str) and '@' in message_1:
+                            message_4 = message.get("4")
+                            
+                            # 优先从message['4']提取（新格式）
+                            if isinstance(message_4, dict) and "senderUserId" in message_4:
+                                temp_user_id = message_4.get("senderUserId", "unknown_user")
+                            # 从message['1']提取（旧格式）
+                            elif isinstance(message_1, str) and '@' in message_1:
                                 temp_user_id = message_1.split('@')[0]
                             elif isinstance(message_1, dict):
                                 # 从字典中提取用户ID
@@ -7407,7 +7428,16 @@ class XianyuLive:
 
                         # 提取商品ID
                         try:
-                            if "1" in message and isinstance(message["1"], dict) and "10" in message["1"] and isinstance(message["1"]["10"], dict):
+                            message_4 = message.get("4")
+                            
+                            # 优先从message['4']['reminderUrl']提取（新格式）
+                            if isinstance(message_4, dict) and "reminderUrl" in message_4:
+                                url_info = message_4.get("reminderUrl", "")
+                                if isinstance(url_info, str) and "itemId=" in url_info:
+                                    temp_item_id = url_info.split("itemId=")[1].split("&")[0]
+                            
+                            # 从message['1']['10']提取（旧格式）
+                            if not temp_item_id and "1" in message and isinstance(message["1"], dict) and "10" in message["1"] and isinstance(message["1"]["10"], dict):
                                 url_info = message["1"]["10"].get("reminderUrl", "")
                                 if isinstance(url_info, str) and "itemId=" in url_info:
                                     temp_item_id = url_info.split("itemId=")[1].split("&")[0]
@@ -7435,7 +7465,13 @@ class XianyuLive:
             user_id = None
             try:
                 message_1 = message.get("1")
-                if isinstance(message_1, str) and '@' in message_1:
+                message_4 = message.get("4")
+                
+                # 优先从message['4']提取（新格式）
+                if isinstance(message_4, dict) and "senderUserId" in message_4:
+                    user_id = message_4.get("senderUserId", "unknown_user")
+                # 从message['1']提取（旧格式）
+                elif isinstance(message_1, str) and '@' in message_1:
                     user_id = message_1.split('@')[0]
                 elif isinstance(message_1, dict):
                     # 如果message['1']是字典，从message["1"]["10"]["senderUserId"]中提取user_id
@@ -7454,7 +7490,16 @@ class XianyuLive:
             # 安全地提取商品ID
             item_id = None
             try:
-                if "1" in message and isinstance(message["1"], dict) and "10" in message["1"] and isinstance(message["1"]["10"], dict):
+                message_4 = message.get("4")
+                
+                # 优先从message['4']['reminderUrl']提取（新格式）
+                if isinstance(message_4, dict) and "reminderUrl" in message_4:
+                    url_info = message_4.get("reminderUrl", "")
+                    if isinstance(url_info, str) and "itemId=" in url_info:
+                        item_id = url_info.split("itemId=")[1].split("&")[0]
+                
+                # 从message['1']['10']提取（旧格式）
+                if not item_id and "1" in message and isinstance(message["1"], dict) and "10" in message["1"] and isinstance(message["1"]["10"], dict):
                     url_info = message["1"]["10"].get("reminderUrl", "")
                     if isinstance(url_info, str) and "itemId=" in url_info:
                         item_id = url_info.split("itemId=")[1].split("&")[0]
@@ -7475,11 +7520,56 @@ class XianyuLive:
                 logger.info(message)
                 msg_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
-                # 安全地检查订单状态
+                # 安全地检查订单状态 - 支持message['3']和message['4']两种结构
                 red_reminder = None
+                reminder_content = None
+                message_4 = None
+                
+                # 检查message['3']结构（旧格式）
                 if isinstance(message, dict) and "3" in message and isinstance(message["3"], dict):
                     red_reminder = message["3"].get("redReminder")
+                
+                # 检查message['4']结构（新格式）
+                if isinstance(message, dict) and "4" in message and isinstance(message["4"], dict):
+                    message_4 = message["4"]
+                    if not red_reminder:
+                        red_reminder = message_4.get("redReminder")
+                    reminder_content = message_4.get("reminderContent")
 
+                # 【优先处理】检查message['4']中的reminderContent是否触发自动发货
+                # 必须在redReminder检查之前，因为两个字段可能有冲突
+                if message_4 and reminder_content and self._is_auto_delivery_trigger(reminder_content):
+                    logger.info(f'[{msg_time}] 【{self.cookie_id}】检测到message[4]自动发货触发消息: {reminder_content}')
+                    
+                    # 使用前面已经提取好的user_id和item_id
+                    send_user_id = user_id if user_id else message_4.get("senderUserId", "unknown")
+                    send_user_name = message_4.get("reminderTitle", "未知用户")
+                    
+                    # 提取chat_id
+                    chat_id = None
+                    if "2" in message:
+                        chat_id_raw = message["2"]
+                        chat_id = chat_id_raw.split('@')[0] if '@' in str(chat_id_raw) else str(chat_id_raw)
+                    
+                    if not chat_id:
+                        chat_id = f"auto_{send_user_id}_{int(time.time())}"
+                    
+                    # 使用已提取的item_id，如果没有则尝试从message_4提取
+                    final_item_id = item_id if item_id and not item_id.startswith("auto_") else None
+                    if not final_item_id and "reminderUrl" in message_4:
+                        url_info = message_4.get("reminderUrl", "")
+                        if isinstance(url_info, str) and "itemId=" in url_info:
+                            final_item_id = url_info.split("itemId=")[1].split("&")[0]
+                    
+                    if not final_item_id:
+                        final_item_id = item_id  # 使用默认值
+                    
+                    # 调用自动发货处理
+                    await self._handle_auto_delivery(websocket, message, send_user_name, send_user_id,
+                                                   final_item_id, chat_id, msg_time)
+                    return
+
+                # 处理其他redReminder状态
                 if red_reminder == '等待买家付款':
                     user_url = f'https://www.goofish.com/personal?userId={user_id}'
                     logger.info(f'[{msg_time}] 【系统】等待买家 {user_url} 付款')
@@ -7492,6 +7582,7 @@ class XianyuLive:
                     user_url = f'https://www.goofish.com/personal?userId={user_id}'
                     logger.info(f'[{msg_time}] 【系统】交易成功 {user_url} 等待卖家发货')
                     # return
+                    
             except:
                 pass
 
@@ -7596,10 +7687,11 @@ class XianyuLive:
                     logger.error(f"订单状态处理失败: {self._safe_str(e)}")
 
             # 【优先处理】检查系统消息和自动发货触发消息（不受人工接入暂停影响）
-            if send_message == '[我已拍下，待付款]':
-                logger.info(f'[{msg_time}] 【{self.cookie_id}】系统消息不处理')
-                return
-            elif send_message == '[你关闭了订单，钱款已原路退返]':
+            # 注释掉 [我已拍下，待付款] 的拦截，让它可以触发自动回复
+            # if send_message == '[我已拍下，待付款]':
+            #     logger.info(f'[{msg_time}] 【{self.cookie_id}】系统消息不处理')
+            #     return
+            if send_message == '[你关闭了订单，钱款已原路退返]':
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】系统消息不处理')
                 return
             elif send_message == '[不想宝贝被砍价?设置不砍价回复  ]':
