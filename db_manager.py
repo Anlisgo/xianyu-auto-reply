@@ -454,6 +454,19 @@ class DBManager:
             )
             ''')
 
+            # 创建Token缓存表（用于缓存IM Token和Device ID，减少API调用频率）
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS token_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT UNIQUE NOT NULL,
+                token TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                expire_at TIMESTAMP NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+
             # 插入默认系统设置（不包括管理员密码，由reply_server.py初始化）
             cursor.execute('''
             INSERT OR IGNORE INTO system_settings (key, value, description) VALUES
@@ -5355,6 +5368,112 @@ class DBManager:
         except Exception as e:
             logger.error(f"清理历史数据时出错: {e}")
             return {'error': str(e)}
+
+
+    # ==================== Token缓存管理 ====================
+
+    def get_cached_token(self, user_id: str) -> Optional[Dict]:
+        """
+        从数据库获取缓存的Token和Device ID
+        
+        查询 token_cache 表，如果存在未过期的记录则返回
+        
+        Args:
+            user_id: 闲鱼用户ID（myid）
+            
+        Returns:
+            包含token和device_id的字典，不存在或已过期则返回None
+        """
+        try:
+            from datetime import datetime
+            with self.lock:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    "SELECT token, device_id, expire_at FROM token_cache WHERE user_id = ?",
+                    (user_id,)
+                )
+                row = cursor.fetchone()
+                
+                if row:
+                    token_val, device_id_val, expire_at_str = row
+                    # 解析过期时间
+                    try:
+                        expire_at = datetime.strptime(expire_at_str, '%Y-%m-%d %H:%M:%S')
+                    except (ValueError, TypeError):
+                        expire_at = datetime.fromisoformat(expire_at_str) if expire_at_str else None
+                    
+                    now = datetime.now()
+                    if expire_at and expire_at > now:
+                        remaining = expire_at - now
+                        remaining_hours = int(remaining.total_seconds() // 3600)
+                        remaining_minutes = int((remaining.total_seconds() % 3600) // 60)
+                        logger.info(f"Token缓存命中: user_id={user_id}, 剩余有效时间={remaining_hours}小时{remaining_minutes}分钟")
+                        return {'token': token_val, 'device_id': device_id_val}
+                    else:
+                        logger.info(f"Token缓存已过期: user_id={user_id}, 过期时间={expire_at_str}")
+                        # 过期则删除
+                        self.delete_cached_token(user_id)
+                else:
+                    logger.info(f"Token缓存未命中: user_id={user_id}")
+        except Exception as e:
+            logger.warning(f"获取Token缓存失败: {e}")
+        return None
+
+    def set_cached_token(self, user_id: str, token: str, device_id: str):
+        """
+        将Token和Device ID缓存到数据库
+        
+        使用 INSERT OR REPLACE 实现插入或更新（基于 user_id 唯一键）
+        过期时间为当前时间 + 20~23小时随机
+        
+        Args:
+            user_id: 闲鱼用户ID（myid）
+            token: IM Token
+            device_id: 设备ID
+        """
+        try:
+            from datetime import datetime, timedelta
+            
+            # 20~23小时随机过期时间
+            ttl_hours = random.uniform(20, 23)
+            expire_at = datetime.now() + timedelta(hours=ttl_hours)
+            expire_at_str = expire_at.strftime('%Y-%m-%d %H:%M:%S')
+            now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            with self.lock:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    """INSERT OR REPLACE INTO token_cache 
+                       (user_id, token, device_id, expire_at, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (user_id, token, device_id, expire_at_str, now_str, now_str)
+                )
+                self.conn.commit()
+                logger.info(f"Token已缓存到数据库: user_id={user_id}, 过期时间={expire_at_str}, TTL={ttl_hours:.1f}小时")
+        except Exception as e:
+            logger.warning(f"缓存Token到数据库失败: {e}")
+
+    def delete_cached_token(self, user_id: str):
+        """
+        删除数据库中缓存的Token
+        
+        Args:
+            user_id: 闲鱼用户ID（myid）
+        """
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                self._execute_sql(
+                    cursor,
+                    "DELETE FROM token_cache WHERE user_id = ?",
+                    (user_id,)
+                )
+                self.conn.commit()
+                logger.info(f"已清除Token缓存: user_id={user_id}")
+        except Exception as e:
+            logger.warning(f"清除Token缓存失败: {e}")
 
 
 # 全局单例
