@@ -1283,11 +1283,12 @@ class XianyuLive:
 
 
 
-    async def refresh_token(self, captcha_retry_count: int = 0):
+    async def refresh_token(self, captcha_retry_count: int = 0, token_expiry_retry_count: int = 0):
         """刷新token
 
         Args:
             captcha_retry_count: 滑块验证重试次数，用于防止无限递归
+            token_expiry_retry_count: 令牌过期重试次数，最多重试1次（独立于滑块验证计数）
         """
         # 初始化通知发送标志，避免重复发送通知
         notification_sent = False
@@ -1298,6 +1299,24 @@ class XianyuLive:
             self.last_token_refresh_status = "started"
             # 重置“刷新流程内已重启”标记，避免多次重启
             self.restarted_in_browser_refresh = False
+
+            # 检查数据库Token缓存（仅首次调用时，滑块重试时跳过缓存使用最新Cookie重新获取）
+            if captcha_retry_count == 0:
+                try:
+                    from db_manager import db_manager
+                    cached = db_manager.get_cached_token(self.myid)
+                    if cached:
+                        cached_token = cached['token']
+                        cached_device_id = cached['device_id']
+                        # 恢复device_id，确保后续注册用同一个
+                        self.device_id = cached_device_id
+                        self.current_token = cached_token
+                        self.last_token_refresh_time = time.time()
+                        self.last_token_refresh_status = "success_from_cache"
+                        logger.info(f"【{self.cookie_id}】使用数据库缓存的Token和Device ID")
+                        return cached_token
+                except Exception as cache_e:
+                    logger.warning(f"【{self.cookie_id}】检查Token缓存异常，继续正常刷新: {self._safe_str(cache_e)}")
 
             # 检查滑块验证重试次数，防止无限递归
             if captcha_retry_count >= self.max_captcha_verification_count:
@@ -1461,22 +1480,16 @@ class XianyuLive:
                     logger.info(f"【{self.cookie_id}】  响应内容: {json.dumps(res_json, ensure_ascii=False, indent=2)}")
                     logger.info(f"【{self.cookie_id}】================================")
 
-                    # 检查并更新Cookie
-                    if 'set-cookie' in response.headers:
-                        new_cookies = {}
-                        for cookie in response.headers.getall('set-cookie', []):
-                            if '=' in cookie:
-                                name, value = cookie.split(';')[0].split('=', 1)
-                                new_cookies[name.strip()] = value.strip()
-
-                        # 更新cookies
-                        if new_cookies:
-                            self.cookies.update(new_cookies)
-                            # 生成新的cookie字符串
-                            self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
-                            # 更新数据库中的Cookie
-                            await self.update_config_cookies()
-                            logger.warning("已更新Cookie到数据库")
+                    # 检查并更新Cookie（使用通用工具函数）
+                    from utils.xianyu_utils import extract_cookies_from_response, is_token_expired_error, is_session_expired_error
+                    new_cookies = extract_cookies_from_response(response)
+                    has_new_cookies = False
+                    if new_cookies:
+                        self.cookies.update(new_cookies)
+                        self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
+                        await self.update_config_cookies()
+                        has_new_cookies = True
+                        logger.info(f"【{self.cookie_id}】Token刷新接口已从Set-Cookie合并 {len(new_cookies)} 个Cookie字段并更新到数据库")
 
                     if isinstance(res_json, dict):
                         ret_value = res_json.get('ret', [])
@@ -1494,6 +1507,12 @@ class XianyuLive:
                                 logger.info(f"【{self.cookie_id}】Token刷新成功")
                                 # 标记为成功
                                 self.last_token_refresh_status = "success"
+                                # 缓存token和device_id到数据库
+                                try:
+                                    from db_manager import db_manager
+                                    db_manager.set_cached_token(self.myid, new_token, self.device_id)
+                                except Exception as cache_e:
+                                    logger.warning(f"【{self.cookie_id}】缓存Token失败: {self._safe_str(cache_e)}")
                                 return new_token
 
                     # 检查是否需要滑块验证
@@ -1547,6 +1566,13 @@ class XianyuLive:
                                 # 重启实例（cookies已在_handle_captcha_verification中更新到数据库）
                                 # await self._restart_instance()
                                 
+                                # 滑块验证成功后，清除旧缓存并重新获取token
+                                try:
+                                    from db_manager import db_manager
+                                    db_manager.delete_cached_token(self.myid)
+                                except Exception as del_e:
+                                    logger.warning(f"【{self.cookie_id}】清除Token缓存失败: {self._safe_str(del_e)}")
+                                
                                 # 重新尝试刷新token（递归调用，但有深度限制）
                                 return await self.refresh_token(captcha_retry_count + 1)
                             else:
@@ -1586,28 +1612,57 @@ class XianyuLive:
                             # 标记已发送通知（通知已在_handle_captcha_verification中发送）
                             notification_sent = True
 
-                    # 检查是否包含"令牌过期"或"Session过期"
+                    # 区分处理令牌过期和Session过期（利用前面已提取的has_new_cookies和ret_value）
                     if isinstance(res_json, dict):
-                        res_json_str = json.dumps(res_json, ensure_ascii=False, separators=(',', ':'))
-                        if '令牌过期' in res_json_str or 'Session过期' in res_json_str:
-                            # 调用统一的密码登录刷新方法
-                            refresh_success = await self._try_password_login_refresh("令牌/Session过期")
+                        # 【令牌过期】Cookie已在前面更新，独立计数重试（不触发密码登录，不消耗滑块重试配额）
+                        if is_token_expired_error(ret_value) and token_expiry_retry_count < 1:
+                            if has_new_cookies:
+                                logger.warning(f"【{self.cookie_id}】令牌过期，已从Set-Cookie更新Cookie，准备重试（第{token_expiry_retry_count + 1}次）...")
+                            else:
+                                logger.warning(f"【{self.cookie_id}】令牌过期但响应中没有Set-Cookie，仍尝试重试...")
+                            # 清除Token缓存
+                            try:
+                                from db_manager import db_manager
+                                db_manager.delete_cached_token(self.myid)
+                            except Exception as del_e:
+                                logger.warning(f"【{self.cookie_id}】清除Token缓存失败: {self._safe_str(del_e)}")
+                            # 用更新后的Cookie重试一次（独立计数，不影响captcha_retry_count）
+                            return await self.refresh_token(
+                                captcha_retry_count=captcha_retry_count,
+                                token_expiry_retry_count=token_expiry_retry_count + 1
+                            )
+                        
+                        # 令牌过期重试已达上限
+                        if is_token_expired_error(ret_value) and token_expiry_retry_count >= 1:
+                            logger.warning(f"【{self.cookie_id}】令牌过期重试已达上限（{token_expiry_retry_count}次），不再重试")
+                        
+                        # 【Session过期】才触发密码登录
+                        if is_session_expired_error(ret_value):
+                            logger.warning(f"【{self.cookie_id}】Session过期，触发密码登录...")
+                            refresh_success = await self._try_password_login_refresh("Session过期")
                             
                             if not refresh_success:
-                                # 标记已发送通知，避免重复通知
                                 notification_sent = True
-                                # 返回None，让调用者知道刷新失败
                                 return None
                             else:
-                                # 刷新成功后，重新尝试获取token
+                                # 密码登录成功后，清除旧缓存并重新获取token
+                                try:
+                                    from db_manager import db_manager
+                                    db_manager.delete_cached_token(self.myid)
+                                except Exception as del_e:
+                                    logger.warning(f"【{self.cookie_id}】清除Token缓存失败: {self._safe_str(del_e)}")
                                 return await self.refresh_token(captcha_retry_count)
-                                
-                                # 刷新失败时继续执行原有的失败处理逻辑
 
                     logger.error(f"【{self.cookie_id}】Token刷新失败: {res_json}")
 
                     # 清空当前token，确保下次重试时重新获取
                     self.current_token = None
+                    # 清除数据库中的Token缓存
+                    try:
+                        from db_manager import db_manager
+                        db_manager.delete_cached_token(self.myid)
+                    except Exception as del_e:
+                        logger.warning(f"【{self.cookie_id}】清除Token缓存失败: {self._safe_str(del_e)}")
 
                     # 只有在没有发送过通知的情况下才发送Token刷新失败通知
                     # 并且WebSocket未连接时才发送（已连接说明只是暂时失败）
@@ -1633,6 +1688,12 @@ class XianyuLive:
 
             # 清空当前token，确保下次重试时重新获取
             self.current_token = None
+            # 清除数据库中的Token缓存
+            try:
+                from db_manager import db_manager
+                db_manager.delete_cached_token(self.myid)
+            except Exception as del_e:
+                logger.warning(f"【{self.cookie_id}】清除Token缓存失败: {self._safe_str(del_e)}")
 
             # 只有在没有发送过通知的情况下才发送Token刷新异常通知
             # 并且WebSocket未连接时才发送（已连接说明只是暂时失败）
@@ -1993,6 +2054,13 @@ class XianyuLive:
                 # 更新数据库中的cookies
                 await self.update_config_cookies()
                 logger.info(f"【{self.cookie_id}】数据库cookies更新成功")
+
+                # Cookie已变更，清除旧的Token缓存（新Cookie需要重新获取Token）
+                try:
+                    from db_manager import db_manager
+                    db_manager.delete_cached_token(self.myid)
+                except Exception as del_e:
+                    logger.warning(f"【{self.cookie_id}】清除Token缓存失败: {self._safe_str(del_e)}")
 
                 # 通过CookieManager重启任务
                 logger.info(f"【{self.cookie_id}】通过CookieManager重启任务...")
@@ -2941,36 +3009,39 @@ class XianyuLive:
             ) as response:
                 res_json = await response.json()
 
-                # 检查并更新Cookie
-                if 'set-cookie' in response.headers:
-                    new_cookies = {}
-                    for cookie in response.headers.getall('set-cookie', []):
-                        if '=' in cookie:
-                            name, value = cookie.split(';')[0].split('=', 1)
-                            new_cookies[name.strip()] = value.strip()
+                # 检查并更新Cookie（使用通用工具函数）
+                from utils.xianyu_utils import extract_cookies_from_response, is_token_expired_error, is_session_expired_error
+                new_cookies = extract_cookies_from_response(response)
+                if new_cookies:
+                    self.cookies.update(new_cookies)
+                    self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
+                    await self.update_config_cookies()
+                    logger.info(f"【{self.cookie_id}】商品详情接口已从Set-Cookie合并 {len(new_cookies)} 个Cookie字段并更新到数据库")
 
-                    # 更新cookies
-                    if new_cookies:
-                        self.cookies.update(new_cookies)
-                        # 生成新的cookie字符串
-                        self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
-                        # 更新数据库中的Cookie
-                        await self.update_config_cookies()
-                        logger.warning("已更新Cookie到数据库")
-
-                logger.warning(f"商品信息获取成功: {res_json}")
                 # 检查返回状态
                 if isinstance(res_json, dict):
                     ret_value = res_json.get('ret', [])
-                    # 检查ret是否包含成功信息
-                    if not any('SUCCESS::调用成功' in ret for ret in ret_value):
-                        logger.warning(f"商品信息API调用失败，错误信息: {ret_value}")
-
+                    # 成功
+                    if any('SUCCESS::调用成功' in ret for ret in ret_value):
+                        logger.info(f"商品信息获取成功: {item_id}")
+                        return res_json
+                    
+                    # 【令牌过期】使用已更新的Cookie重试（不触发密码登录）
+                    if is_token_expired_error(ret_value):
+                        logger.warning(f"【{self.cookie_id}】商品详情接口令牌过期，使用新Cookie重试...")
                         await asyncio.sleep(0.5)
                         return await self.get_item_info(item_id, retry_count + 1)
-                    else:
-                        logger.warning(f"商品信息获取成功: {item_id}")
-                        return res_json
+                    
+                    # 【Session过期】触发密码登录（不阻塞，不重试当前请求）
+                    if is_session_expired_error(ret_value):
+                        logger.warning(f"【{self.cookie_id}】商品详情接口Session过期，触发密码登录...")
+                        await self._try_password_login_refresh("Session过期(商品详情)")
+                        return {"error": f"Session过期: {ret_value}"}
+                    
+                    # 其他错误，普通重试
+                    logger.warning(f"商品信息API调用失败，错误信息: {ret_value}")
+                    await asyncio.sleep(0.5)
+                    return await self.get_item_info(item_id, retry_count + 1)
                 else:
                     logger.error(f"商品信息API返回格式异常: {res_json}")
                     return await self.get_item_info(item_id, retry_count + 1)
@@ -4385,6 +4456,7 @@ class XianyuLive:
             secure_freeshipping.current_token = self.current_token
             secure_freeshipping.last_token_refresh_time = self.last_token_refresh_time
             secure_freeshipping.token_refresh_interval = self.token_refresh_interval
+            secure_freeshipping.main_instance = self  # 传递主实例引用，用于触发密码登录
 
             # 调用免拼发货方法
             return await secure_freeshipping.auto_freeshipping(order_id, item_id, buyer_id, retry_count)
@@ -5979,6 +6051,10 @@ class XianyuLive:
         Returns:
             bool: 成功返回True，失败返回False
         """
+        # 已禁用浏览器刷新Cookie功能，直接返回成功
+        logger.info(f"【{self.cookie_id}】浏览器页面Cookie刷新已禁用，跳过")
+        return True
+
         playwright = None
         browser = None
 
@@ -6272,6 +6348,10 @@ class XianyuLive:
             triggered_by_refresh_token: 是否由refresh_token方法触发，如果是True则设置browser_cookie_refreshed标志
         """
 
+
+        # 已禁用浏览器刷新Cookie功能，直接返回成功
+        logger.info(f"【{self.cookie_id}】浏览器Cookie刷新已禁用，跳过")
+        return True
 
         playwright = None
         browser = None
@@ -8253,27 +8333,22 @@ class XianyuLive:
             ) as response:
                 res_json = await response.json()
 
-                # 检查并更新Cookie
-                if 'set-cookie' in response.headers:
-                    new_cookies = {}
-                    for cookie in response.headers.getall('set-cookie', []):
-                        if '=' in cookie:
-                            name, value = cookie.split(';')[0].split('=', 1)
-                            new_cookies[name.strip()] = value.strip()
-
-                    # 更新cookies
-                    if new_cookies:
-                        self.cookies.update(new_cookies)
-                        # 生成新的cookie字符串
-                        self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
-                        # 更新数据库中的Cookie
-                        await self.update_config_cookies()
-                        logger.warning("已更新Cookie到数据库")
+                # 检查并更新Cookie（使用通用工具函数）
+                from utils.xianyu_utils import extract_cookies_from_response, is_token_expired_error, is_session_expired_error
+                new_cookies = extract_cookies_from_response(response)
+                if new_cookies:
+                    self.cookies.update(new_cookies)
+                    self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
+                    await self.update_config_cookies()
+                    logger.info(f"【{self.cookie_id}】商品列表接口已从Set-Cookie合并 {len(new_cookies)} 个Cookie字段并更新到数据库")
 
                 logger.info(f"商品信息获取响应: {res_json}")
 
+                # 检查返回状态
+                ret_value = res_json.get('ret', []) if isinstance(res_json, dict) else []
+
                 # 检查响应是否成功
-                if res_json.get('ret') and res_json['ret'][0] == 'SUCCESS::调用成功':
+                if ret_value and any('SUCCESS::调用成功' in ret for ret in ret_value):
                     items_data = res_json.get('data', {})
                     # 从cardList中提取商品信息
                     card_list = items_data.get('cardList', [])
@@ -8342,15 +8417,22 @@ class XianyuLive:
                         "raw_data": items_data  # 保留原始数据以备调试
                     }
                 else:
-                    # 检查是否是token失效
-                    error_msg = res_json.get('ret', [''])[0] if res_json.get('ret') else ''
-                    if 'FAIL_SYS_TOKEN_EXOIRED' in error_msg or 'token' in error_msg.lower():
-                        logger.warning(f"Token失效，准备重试: {error_msg}")
+                    # 【令牌过期】使用已更新的Cookie重试（不触发密码登录）
+                    if is_token_expired_error(ret_value):
+                        logger.warning(f"【{self.cookie_id}】商品列表接口令牌过期，使用新Cookie重试...")
                         await asyncio.sleep(0.5)
                         return await self.get_item_list_info(page_number, page_size, retry_count + 1)
-                    else:
-                        logger.error(f"获取商品信息失败: {res_json}")
-                        return {"error": f"获取商品信息失败: {error_msg}"}
+                    
+                    # 【Session过期】触发密码登录（不阻塞，不重试当前请求）
+                    if is_session_expired_error(ret_value):
+                        logger.warning(f"【{self.cookie_id}】商品列表接口Session过期，触发密码登录...")
+                        await self._try_password_login_refresh("Session过期(商品列表)")
+                        return {"error": f"Session过期: {ret_value}"}
+                    
+                    # 其他错误
+                    error_msg = ret_value[0] if ret_value else '未知错误'
+                    logger.error(f"获取商品信息失败: {res_json}")
+                    return {"error": f"获取商品信息失败: {error_msg}"}
 
         except Exception as e:
             logger.error(f"商品信息API请求异常: {self._safe_str(e)}")
